@@ -85,7 +85,7 @@ impl SnapshotLog {
     }
 
     /// Load entries from a specific snapshot
-    async fn load_snapshot(&self, key: &str) -> Result<Vec<Entry>> {
+    pub async fn load_snapshot(&self, key: &str) -> Result<Vec<Entry>> {
         let data = self.store.get(key).await?;
         let snapshot: Snapshot = serde_json::from_slice(&data)?;
         Ok(snapshot.entries)

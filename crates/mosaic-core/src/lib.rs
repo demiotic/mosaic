@@ -1,6 +1,6 @@
 //! Mosaic Core - Storage format for distributed memory systems
 //!
-//! Version: 0.4.0 - "WAL & Crash Safety + Feature Detection"
+//! Version: 0.5.0 - "Multi-Writer (Optimistic Locking)"
 //!
 //! This crate provides the core functionality for Mosaic:
 //! - Content-addressed blob storage
@@ -62,6 +62,7 @@
 //! ```
 
 pub mod capabilities;
+pub mod concurrency;
 pub mod error;
 pub mod storage;
 pub mod store;
@@ -69,6 +70,7 @@ pub mod types;
 
 // Re-export main types for convenience
 pub use capabilities::{Capabilities, DegradationPolicy, Feature, FeatureInfo};
+pub use concurrency::{RetryPolicy, retry_with_backoff};
 pub use error::{MosaicError, Result};
 pub use store::MosaicStore;
 pub use types::{Entry, EntryId, EntryMetadata};

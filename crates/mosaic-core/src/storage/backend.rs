@@ -39,6 +39,13 @@ pub trait ObjectStore: Send + Sync + Debug {
     /// Get an object from storage
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
 
+    /// Get an object with its metadata (for optimistic locking)
+    async fn get_with_metadata(&self, key: &str) -> Result<(Vec<u8>, ObjectMetadata)> {
+        let data = self.get(key).await?;
+        let metadata = self.head(key).await?;
+        Ok((data, metadata))
+    }
+
     /// Get object metadata without downloading content
     async fn head(&self, key: &str) -> Result<ObjectMetadata>;
 

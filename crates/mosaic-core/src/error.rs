@@ -23,6 +23,9 @@ pub enum MosaicError {
     #[error("Invalid entry: {0}")]
     InvalidEntry(String),
 
+    #[error("Precondition failed (optimistic lock): {0}")]
+    PreconditionFailed(String),
+
     #[error("Arrow error: {0}")]
     ArrowError(#[from] arrow::error::ArrowError),
 

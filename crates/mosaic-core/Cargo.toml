@@ -32,6 +32,7 @@ async-trait = "0.1"
 
 # Utility
 md5 = "0.7"
+rand.workspace = true
 
 # Backend-specific dependencies (feature-gated)
 aws-config = { workspace = true, optional = true }

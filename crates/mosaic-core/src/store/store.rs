@@ -16,10 +16,13 @@ use crate::storage::snapshots::SnapshotLog;
 use crate::storage::wal::WalManager;
 use crate::types::{Entry, EntryId, EntryMetadata};
 
-/// Mosaic Store - v0.4.0 "WAL & Crash Safety + Feature Detection"
+/// Mosaic Store - v0.5.0 "Multi-Writer (Optimistic Locking)"
 ///
 /// Features:
-/// - Single-writer only
+/// - **Multi-writer support with optimistic locking** (v0.5.0)
+/// - **Per-writer snapshot files** (v0.5.0)
+/// - **Exponential backoff with jitter for retries** (v0.5.0)
+/// - **Conflict resolution (last write wins)** (v0.5.0)
 /// - Tabular data only (Arrow → Parquet)
 /// - Content-addressed blob storage
 /// - Append-only snapshot log with pre-built indexes
@@ -87,12 +90,12 @@ impl MosaicStore {
             None
         };
 
-        // Initialize capabilities for v0.4.0
-        let capabilities = Self::initialize_capabilities("0.4.0", enable_wal);
+        // Initialize capabilities for v0.5.0
+        let capabilities = Self::initialize_capabilities("0.5.0", enable_wal);
 
         Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
-            snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
+            snapshot_log: SnapshotLog::with_writer_id(store.clone(), prefix.clone(), writer_id.clone()),
             index_manager,
             manifest_manager,
             manifest,
@@ -175,11 +178,11 @@ impl MosaicStore {
         };
 
         // Initialize capabilities
-        let capabilities = Self::initialize_capabilities("0.4.0", enable_wal);
+        let capabilities = Self::initialize_capabilities("0.5.0", enable_wal);
 
         Ok(Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
-            snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
+            snapshot_log: SnapshotLog::with_writer_id(store.clone(), prefix.clone(), writer_id.clone()),
             index_manager,
             manifest_manager,
             manifest,
@@ -282,22 +285,30 @@ impl MosaicStore {
             index_mgr.build_indexes(vec![entry], &snapshot_path)?;
         }
 
-        // 9. Update manifest with snapshot info (v0.3.0)
+        // 9. Update manifest with snapshot info using optimistic locking (v0.5.0)
+        let snapshot_info = SnapshotInfo {
+            path: snapshot_path.clone(),
+            writer_id: Some(self.writer_id.clone()),
+            entry_count: 1,
+            size_bytes: parquet_bytes.len() as u64,
+            format: "json".to_string(),
+            checksum: Some(snapshot_checksum),
+            created_at: Utc::now(),
+        };
+
+        // 10. Persist manifest with optimistic locking and retry (v0.5.0)
+        self.manifest_manager
+            .update_with_retry(|manifest| {
+                manifest.add_snapshot(snapshot_info.clone());
+                Ok(())
+            })
+            .await?;
+
+        // Update local manifest cache
         {
             let mut manifest = self.manifest.write().await;
-            let snapshot_info = SnapshotInfo {
-                path: snapshot_path.clone(),
-                entry_count: 1,
-                size_bytes: parquet_bytes.len() as u64,
-                format: "json".to_string(),
-                checksum: Some(snapshot_checksum),
-                created_at: Utc::now(),
-            };
             manifest.add_snapshot(snapshot_info);
         }
-
-        // 10. Persist manifest
-        self.persist_manifest().await?;
 
         // 11. WAL: Remove pending write (success) (v0.4.0)
         if let Some(wal) = &self.wal_manager {
@@ -660,12 +671,14 @@ mod tests {
             base_path: None,
         });
 
-        let store = MosaicStore::new(
+        let store = MosaicStore::load(
             Arc::new(backend),
             "test-mosaic".to_string(),
             None,    // Auto-generate writer ID
             false,   // Disable WAL for this test
-        );
+        )
+        .await
+        .unwrap();
 
         let batch = create_test_record_batch();
 
@@ -761,7 +774,7 @@ mod tests {
 
         // Check capabilities
         let caps = store_with_wal.get_capabilities();
-        assert_eq!(caps.version, "0.4.0");
+        assert_eq!(caps.version, "0.5.0");
         assert!(caps.supports(Feature::Wal));
 
         // Check feature info

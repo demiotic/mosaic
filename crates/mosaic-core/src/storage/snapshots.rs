@@ -9,24 +9,49 @@ use crate::types::{Entry, Snapshot};
 pub struct SnapshotLog {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    writer_id: Option<String>,
 }
 
 impl SnapshotLog {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            writer_id: None,
+        }
+    }
+
+    /// Create a new snapshot log with writer ID for multi-writer support (v0.5.0+)
+    pub fn with_writer_id(store: Arc<dyn ObjectStore>, prefix: String, writer_id: String) -> Self {
+        Self {
+            store,
+            prefix,
+            writer_id: Some(writer_id),
+        }
     }
 
     /// Append a new entry to the snapshot log
     /// Each snapshot is stored as a separate JSON file
     ///
+    /// For multi-writer mode (v0.5.0+), snapshots are named: snapshot-{timestamp}-{writer_id}.json
+    /// For single-writer mode, snapshots are named: snapshot-{timestamp}.json
+    ///
     /// Returns (snapshot_key, checksum)
     pub async fn append_entry(&self, entry: Entry) -> Result<(String, String)> {
         let timestamp = Utc::now();
-        let snapshot_key = format!(
-            "{}/snapshots/snapshot-{}.json",
-            self.prefix,
-            timestamp.format("%Y%m%d-%H%M%S-%6f")
-        );
+        let snapshot_key = match &self.writer_id {
+            Some(writer_id) => format!(
+                "{}/snapshots/snapshot-{}-{}.json",
+                self.prefix,
+                timestamp.format("%Y%m%d-%H%M%S-%6f"),
+                writer_id
+            ),
+            None => format!(
+                "{}/snapshots/snapshot-{}.json",
+                self.prefix,
+                timestamp.format("%Y%m%d-%H%M%S-%6f")
+            ),
+        };
 
         let snapshot = Snapshot {
             timestamp,

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::concurrency::RetryPolicy;
 use crate::error::{MosaicError, Result};
 use crate::storage::backend::ObjectStore;
 
@@ -93,6 +94,10 @@ pub struct FeatureFlags {
 pub struct SnapshotInfo {
     /// Snapshot file path (relative to store prefix)
     pub path: String,
+
+    /// Writer ID that created this snapshot (v0.5.0+)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writer_id: Option<String>,
 
     /// Number of entries in this snapshot
     pub entry_count: u64,
@@ -211,11 +216,25 @@ impl Default for FeatureFlags {
 pub struct ManifestManager {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    retry_policy: RetryPolicy,
 }
 
 impl ManifestManager {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            retry_policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Create a new manifest manager with custom retry policy
+    pub fn with_retry_policy(store: Arc<dyn ObjectStore>, prefix: String, retry_policy: RetryPolicy) -> Self {
+        Self {
+            store,
+            prefix,
+            retry_policy,
+        }
     }
 
     /// Get the manifest file path
@@ -248,6 +267,35 @@ impl ManifestManager {
         Ok(Some(manifest))
     }
 
+    /// Load the manifest with ETag for optimistic locking
+    ///
+    /// Returns (manifest, etag) tuple, or None if manifest doesn't exist
+    pub async fn load_with_etag(&self) -> Result<Option<(Manifest, String)>> {
+        let path = self.manifest_path();
+
+        if !self.store.exists(&path).await? {
+            return Ok(None);
+        }
+
+        let (data, metadata) = self.store.get_with_metadata(&path).await?;
+        let etag = metadata.etag.ok_or_else(|| {
+            MosaicError::Storage("Backend does not support ETags for optimistic locking".to_string())
+        })?;
+
+        let json = String::from_utf8(data)
+            .map_err(|e| MosaicError::SerializationError(e.to_string()))?;
+
+        let manifest = Manifest::from_json(&json)?;
+
+        tracing::debug!(
+            "Loaded manifest for store '{}' with ETag: {}",
+            manifest.store_id,
+            etag
+        );
+
+        Ok(Some((manifest, etag)))
+    }
+
     /// Save the manifest to storage
     pub async fn save(&self, manifest: &Manifest) -> Result<()> {
         let path = self.manifest_path();
@@ -263,6 +311,99 @@ impl ManifestManager {
         );
 
         Ok(())
+    }
+
+    /// Save the manifest with optimistic locking (conditional write)
+    ///
+    /// Returns Ok(()) if successful, or Err if the ETag doesn't match (concurrent modification)
+    pub async fn save_if_match(&self, manifest: &Manifest, etag: &str) -> Result<()> {
+        let path = self.manifest_path();
+        let json = manifest.to_json()?;
+
+        self.store.put_if_match(&path, json.into_bytes(), etag).await?;
+
+        tracing::info!(
+            "Saved manifest for store '{}' with optimistic lock ({} snapshots, {} indexes)",
+            manifest.store_id,
+            manifest.snapshots.len(),
+            manifest.indexes.len()
+        );
+
+        Ok(())
+    }
+
+    /// Update the manifest with a mutation function, using optimistic locking with retries
+    ///
+    /// This method:
+    /// 1. Loads the current manifest with ETag
+    /// 2. Applies the mutation function
+    /// 3. Attempts to save with conditional write
+    /// 4. Retries with exponential backoff if there's a conflict
+    ///
+    /// # Example
+    /// ```no_run
+    /// use mosaic_core::storage::manifest::{ManifestManager, SnapshotInfo};
+    /// use chrono::Utc;
+    ///
+    /// async fn add_snapshot(manager: &ManifestManager, snapshot: SnapshotInfo) {
+    ///     manager.update_with_retry(|manifest| {
+    ///         manifest.add_snapshot(snapshot.clone());
+    ///         Ok(())
+    ///     }).await.unwrap();
+    /// }
+    /// ```
+    pub async fn update_with_retry<F>(&self, mut mutate: F) -> Result<()>
+    where
+        F: FnMut(&mut Manifest) -> Result<()>,
+    {
+        let mut attempts = 0;
+        let max_attempts = self.retry_policy.max_attempts;
+
+        loop {
+            // Load manifest with ETag
+            let (data, metadata) = self.store.get_with_metadata(&self.manifest_path()).await?;
+            let etag = metadata.etag.ok_or_else(|| {
+                MosaicError::Storage("Backend does not support ETags for optimistic locking".to_string())
+            })?;
+
+            let json = String::from_utf8(data)
+                .map_err(|e| MosaicError::SerializationError(e.to_string()))?;
+
+            let mut manifest = Manifest::from_json(&json)?;
+
+            // Apply mutation
+            mutate(&mut manifest)?;
+
+            // Serialize updated manifest
+            let updated_json = manifest.to_json()?;
+
+            // Attempt conditional write
+            match self.store.put_if_match(&self.manifest_path(), updated_json.into_bytes(), &etag).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "Updated manifest for store '{}' with optimistic lock",
+                        manifest.store_id
+                    );
+                    return Ok(());
+                }
+                Ok(false) | Err(MosaicError::PreconditionFailed(_)) => {
+                    // ETag mismatch or precondition failed
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(MosaicError::PreconditionFailed(
+                            format!("Failed to update manifest after {} attempts", attempts)
+                        ));
+                    }
+
+                    tracing::debug!("Manifest update conflict (attempt {}), retrying...", attempts);
+
+                    // Exponential backoff with jitter
+                    let delay = self.retry_policy.calculate_delay(attempts);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Create a new manifest and save it
@@ -323,6 +464,7 @@ mod tests {
 
         let snapshot = SnapshotInfo {
             path: "snapshots/snapshot-001.json".to_string(),
+            writer_id: Some("writer-1".to_string()),
             entry_count: 100,
             size_bytes: 1024,
             format: "json".to_string(),
@@ -373,6 +515,7 @@ mod tests {
 
         manifest.add_snapshot(SnapshotInfo {
             path: "snapshot-1.json".to_string(),
+            writer_id: None,
             entry_count: 100,
             size_bytes: 1024,
             format: "json".to_string(),

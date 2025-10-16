@@ -52,7 +52,7 @@ async fn test_store_1000_entries() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend), "scale-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend), "scale-store".to_string(), None, false).await.unwrap();
 
     // Store 1000 entries
     println!("📝 Storing 1000 entries...");
@@ -128,7 +128,7 @@ async fn test_deduplication() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend.clone()), "dedup-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend.clone()), "dedup-store".to_string(), None, false).await.unwrap();
 
     // Create identical batch
     let batch = create_test_batch(42);
@@ -174,7 +174,7 @@ async fn test_query_not_found() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend), "notfound-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend), "notfound-store".to_string(), None, false).await.unwrap();
 
     // Try to get non-existent query
     let result = store.get_entry("non_existent_query").await;
@@ -193,10 +193,12 @@ async fn test_concurrent_retrieval() {
         ..Default::default()
     });
 
-    let store = Arc::new(MosaicStore::new(
+    let store = Arc::new(MosaicStore::load(
         Arc::new(backend),
         "concurrent-store".to_string(),
-    ));
+        None,   // Auto-generate writer ID
+        false,  // Disable WAL
+    ).await.unwrap());
 
     // Store 100 entries
     println!("📝 Storing 100 entries...");
@@ -247,7 +249,7 @@ async fn test_large_batch() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend), "large-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend), "large-store".to_string(), None, false).await.unwrap();
 
     // Create a large batch (10,000 rows)
     println!("📝 Creating batch with 10,000 rows...");

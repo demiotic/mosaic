@@ -54,7 +54,7 @@ async fn test_indexed_query_performance() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend), "benchmark-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend), "benchmark-store".to_string(), None, false).await.unwrap();
 
     // Store 10,000 entries
     println!("📝 Storing 10,000 entries...");
@@ -147,7 +147,7 @@ async fn test_time_range_query_performance() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend), "time-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend), "time-store".to_string(), None, false).await.unwrap();
 
     // Store 1,000 entries over simulated time
     println!("📝 Storing 1,000 entries...");
@@ -205,7 +205,7 @@ async fn test_speedup_vs_linear_scan() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend.clone()), "speedup-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend.clone()), "speedup-store".to_string(), None, false).await.unwrap();
 
     // Store 1,000 entries for faster test
     println!("📝 Storing 1,000 entries...");
@@ -270,7 +270,7 @@ async fn test_index_overhead() {
         ..Default::default()
     });
 
-    let store = MosaicStore::new(Arc::new(backend.clone()), "overhead-store".to_string());
+    let store = MosaicStore::load(Arc::new(backend.clone()), "overhead-store".to_string(), None, false).await.unwrap();
 
     // Store 1,000 entries
     println!("📝 Storing 1,000 entries...");

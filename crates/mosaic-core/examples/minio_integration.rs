@@ -58,7 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create Mosaic store
     println!("2. Creating Mosaic store...");
-    let store = MosaicStore::new(Arc::from(backend), "mosaic-demo".to_string());
+    let store = MosaicStore::new(
+        Arc::from(backend),
+        "mosaic-demo".to_string(),
+        None,   // Auto-generate writer ID
+        false,  // Disable WAL for this example
+    );
     println!("✓ Mosaic store created\n");
 
     // Create sample data

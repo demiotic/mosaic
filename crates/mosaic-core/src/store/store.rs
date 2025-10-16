@@ -10,15 +10,20 @@ use crate::storage::backend::ObjectStore;
 use crate::storage::blobs::{
     deserialize_parquet_to_record_batch, serialize_record_batch_to_parquet, BlobStorage,
 };
+use crate::storage::compaction::{CompactionManager, CompactionResult};
 use crate::storage::indexes::{IndexManager, IndexStats};
 use crate::storage::manifest::{IndexInfo, Manifest, ManifestManager, SnapshotInfo};
 use crate::storage::snapshots::SnapshotLog;
 use crate::storage::wal::WalManager;
 use crate::types::{Entry, EntryId, EntryMetadata};
 
-/// Mosaic Store - v0.5.0 "Multi-Writer (Optimistic Locking)"
+/// Mosaic Store - v0.6.0 "Compaction"
 ///
 /// Features:
+/// - **Manual compaction with lease coordination** (v0.6.0)
+/// - **Snapshot merging and deduplication** (v0.6.0)
+/// - **Index rebuilding from compacted snapshots** (v0.6.0)
+/// - **Atomic manifest swap with two-phase commit** (v0.6.0)
 /// - **Multi-writer support with optimistic locking** (v0.5.0)
 /// - **Per-writer snapshot files** (v0.5.0)
 /// - **Exponential backoff with jitter for retries** (v0.5.0)
@@ -90,8 +95,8 @@ impl MosaicStore {
             None
         };
 
-        // Initialize capabilities for v0.5.0
-        let capabilities = Self::initialize_capabilities("0.5.0", enable_wal);
+        // Initialize capabilities for v0.6.0
+        let capabilities = Self::initialize_capabilities("0.6.0", enable_wal);
 
         Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
@@ -178,7 +183,7 @@ impl MosaicStore {
         };
 
         // Initialize capabilities
-        let capabilities = Self::initialize_capabilities("0.5.0", enable_wal);
+        let capabilities = Self::initialize_capabilities("0.6.0", enable_wal);
 
         Ok(Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
@@ -618,6 +623,69 @@ impl MosaicStore {
     pub fn writer_id(&self) -> &str {
         &self.writer_id
     }
+
+    /// Perform manual compaction (v0.6.0)
+    ///
+    /// Merges all snapshots into a single compacted snapshot with:
+    /// - Deduplication (latest entry by created_at wins)
+    /// - Index rebuilding from compacted snapshot
+    /// - Atomic manifest swap
+    /// - Lease-based coordination (only one writer compacts at a time)
+    ///
+    /// # Returns
+    /// * `CompactionResult` - Compaction statistics
+    ///
+    /// # Errors
+    /// * Returns error if lease cannot be acquired (another writer is compacting)
+    /// * Returns error if compaction fails during any phase
+    pub async fn compact(&self) -> Result<CompactionResult> {
+        tracing::info!("Starting compaction for store '{}'", self.prefix);
+
+        let compaction_manager = CompactionManager::new(
+            self.store.clone(),
+            self.prefix.clone(),
+            self.writer_id.clone(),
+        );
+
+        let result = compaction_manager.compact().await?;
+
+        // Reload manifest after compaction
+        if let Some(updated_manifest) = self.manifest_manager.load().await? {
+            let mut manifest = self.manifest.write().await;
+            *manifest = updated_manifest;
+        }
+
+        // Reload indexes after compaction
+        self.load_indexes().await?;
+
+        tracing::info!(
+            "Compaction completed: {} snapshots → {} snapshots, {} → {} entries (duration: {:.2}s)",
+            result.snapshots_before,
+            result.snapshots_after,
+            result.total_entries,
+            result.unique_entries,
+            result.duration_seconds
+        );
+
+        Ok(result)
+    }
+
+    /// Check if compaction is needed (v0.6.0)
+    ///
+    /// # Arguments
+    /// * `threshold` - Minimum number of snapshots before compaction is recommended
+    ///
+    /// # Returns
+    /// * `bool` - True if compaction is recommended
+    pub async fn should_compact(&self, threshold: usize) -> Result<bool> {
+        let compaction_manager = CompactionManager::new(
+            self.store.clone(),
+            self.prefix.clone(),
+            self.writer_id.clone(),
+        );
+
+        compaction_manager.should_compact(threshold).await
+    }
 }
 
 #[cfg(test)]
@@ -774,7 +842,7 @@ mod tests {
 
         // Check capabilities
         let caps = store_with_wal.get_capabilities();
-        assert_eq!(caps.version, "0.5.0");
+        assert_eq!(caps.version, "0.6.0");
         assert!(caps.supports(Feature::Wal));
 
         // Check feature info

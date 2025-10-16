@@ -53,6 +53,14 @@ pub struct Manifest {
     /// Active indexes with metadata
     pub indexes: Vec<IndexInfo>,
 
+    /// Compaction policy configuration (v0.8.0+)
+    #[serde(default)]
+    pub compaction_policy: CompactionPolicy,
+
+    /// Garbage collection policy (v0.8.0+)
+    #[serde(default)]
+    pub gc_policy: GCPolicy,
+
     /// Reserved for future extensions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<HashMap<String, serde_json::Value>>,
@@ -88,6 +96,107 @@ pub struct FeatureFlags {
     #[serde(flatten)]
     pub unknown_flags: HashMap<String, serde_json::Value>,
 }
+
+/// Compaction policy configuration (v0.8.0+)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionPolicy {
+    /// Enable automatic compaction
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Trigger compaction when snapshot count exceeds this threshold
+    #[serde(default = "default_snapshot_threshold")]
+    pub trigger_snapshot_count: usize,
+
+    /// Trigger compaction when oldest snapshot exceeds this age (hours)
+    #[serde(default = "default_age_threshold")]
+    pub trigger_age_hours: i64,
+
+    /// Grace period before deleting old snapshots after compaction (seconds)
+    #[serde(default = "default_grace_period")]
+    pub grace_period_seconds: i64,
+
+    /// Last compaction timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_compaction: Option<DateTime<Utc>>,
+
+    /// Throttling configuration
+    #[serde(default)]
+    pub throttling: ThrottlingConfig,
+
+    /// Incremental compaction configuration
+    #[serde(default)]
+    pub incremental: IncrementalConfig,
+}
+
+/// Throttling configuration for compaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThrottlingConfig {
+    /// Enable throttling
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum bandwidth in MB/s
+    #[serde(default = "default_bandwidth")]
+    pub max_bandwidth_mbps: u64,
+
+    /// Allowed hours for compaction (UTC, 0-23)
+    #[serde(default = "default_allowed_hours")]
+    pub allowed_hours: Vec<u8>,
+}
+
+/// Incremental compaction configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalConfig {
+    /// Enable incremental compaction
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Number of snapshots to compact in each batch
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
+    /// Maximum duration for compaction (minutes)
+    #[serde(default = "default_max_duration")]
+    pub max_duration_minutes: u64,
+}
+
+/// GC policy configuration (v0.8.0+)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GCPolicy {
+    /// Enable automatic garbage collection
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Grace period before deleting orphaned blobs (hours)
+    #[serde(default = "default_gc_grace_period")]
+    pub grace_period_hours: i64,
+
+    /// Scan interval for GC (hours)
+    #[serde(default = "default_gc_scan_interval")]
+    pub scan_interval_hours: i64,
+
+    /// Last GC run timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_gc: Option<DateTime<Utc>>,
+
+    /// Maintenance window (UTC hours, 0-23)
+    #[serde(default = "default_maintenance_window")]
+    pub maintenance_window: Vec<u8>,
+}
+
+// Default values for serde
+fn default_true() -> bool { true }
+fn default_snapshot_threshold() -> usize { 50 }
+fn default_age_threshold() -> i64 { 6 }
+fn default_grace_period() -> i64 { 3600 }
+fn default_bandwidth() -> u64 { 100 }
+fn default_allowed_hours() -> Vec<u8> { vec![0, 1, 2, 3, 4, 5, 22, 23] }
+fn default_batch_size() -> usize { 10 }
+fn default_max_duration() -> u64 { 30 }
+fn default_gc_grace_period() -> i64 { 48 }
+fn default_gc_scan_interval() -> i64 { 168 }
+fn default_maintenance_window() -> Vec<u8> { vec![2, 3, 4] }
 
 /// Snapshot file metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +265,8 @@ impl Manifest {
             features: FeatureFlags::default(),
             snapshots: Vec::new(),
             indexes: Vec::new(),
+            compaction_policy: CompactionPolicy::default(),
+            gc_policy: GCPolicy::default(),
             extensions: None,
         }
     }
@@ -208,6 +319,52 @@ impl Default for FeatureFlags {
             parquet_snapshots: false, // v0.3.0 will enable this
             checksums: false,         // v0.3.0 will enable this
             unknown_flags: HashMap::new(),
+        }
+    }
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger_snapshot_count: 50,
+            trigger_age_hours: 6,
+            grace_period_seconds: 3600,
+            last_compaction: None,
+            throttling: ThrottlingConfig::default(),
+            incremental: IncrementalConfig::default(),
+        }
+    }
+}
+
+impl Default for ThrottlingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bandwidth_mbps: 100,
+            allowed_hours: vec![0, 1, 2, 3, 4, 5, 22, 23],
+        }
+    }
+}
+
+impl Default for IncrementalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            batch_size: 10,
+            max_duration_minutes: 30,
+        }
+    }
+}
+
+impl Default for GCPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            grace_period_hours: 48,
+            scan_interval_hours: 168, // Weekly
+            last_gc: None,
+            maintenance_window: vec![2, 3, 4],
         }
     }
 }

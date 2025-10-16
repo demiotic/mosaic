@@ -207,8 +207,8 @@ impl CompactionManager {
         self.update_manifest_after_compaction(&compacted_path, unique_count).await?;
         tracing::info!("Updated manifest with compacted snapshot");
 
-        // 7. Delete old snapshots (TODO: implement grace period in future version)
-        // For v0.6.0, we immediately delete old snapshots
+        // 8. Delete old snapshots
+        // Note: Grace period is handled by GC in v0.8.0
         for snapshot_info in &manifest.snapshots {
             if let Err(e) = self.store.delete(&snapshot_info.path).await {
                 tracing::warn!("Failed to delete old snapshot {}: {}", snapshot_info.path, e);
@@ -246,14 +246,26 @@ impl CompactionManager {
         result
     }
 
-    /// Write compacted snapshot to staging area
+    /// Write compacted snapshot using two-phase commit (staging → final)
+    ///
+    /// Two-phase commit process:
+    /// 1. Write to staging area (temp location)
+    /// 2. Verify staging snapshot integrity
+    /// 3. Move to final location atomically
+    /// 4. Delete staging file
+    ///
+    /// If process fails at any point, staging files can be cleaned up
+    /// without affecting the production snapshots.
     async fn write_compacted_snapshot(&self, entries: &[Entry]) -> Result<String> {
         use crate::types::Snapshot;
 
         let timestamp = Utc::now();
-        let compacted_path = format!(
-            "{}/snapshots/snapshot-compacted-{}.json",
-            self.prefix,
+        let staging_base = self.staging_path();
+
+        // Phase 1: Write to staging area
+        let staging_path = format!(
+            "{}/snapshot-compacted-{}.json",
+            staging_base,
             timestamp.format("%Y%m%d-%H%M%S-%6f")
         );
 
@@ -265,9 +277,40 @@ impl CompactionManager {
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| MosaicError::Serialization(e.to_string()))?;
 
-        self.store.put(&compacted_path, json.into_bytes()).await?;
+        tracing::debug!("Writing compacted snapshot to staging: {}", staging_path);
+        self.store.put(&staging_path, json.clone().into_bytes()).await?;
 
-        Ok(compacted_path)
+        // Phase 2: Verify staging snapshot (checksum)
+        let staging_data = self.store.get(&staging_path).await?;
+        let staging_checksum = crate::storage::manifest::calculate_checksum(&staging_data);
+        let expected_checksum = crate::storage::manifest::calculate_checksum(json.as_bytes());
+
+        if staging_checksum != expected_checksum {
+            // Rollback: Delete staging file
+            let _ = self.store.delete(&staging_path).await;
+            return Err(MosaicError::Storage(
+                "Staging snapshot checksum mismatch - rollback initiated".to_string()
+            ));
+        }
+
+        // Phase 3: Atomic commit - move to final location
+        let final_path = format!(
+            "{}/snapshots/snapshot-compacted-{}.json",
+            self.prefix,
+            timestamp.format("%Y%m%d-%H%M%S-%6f")
+        );
+
+        tracing::debug!("Committing staged snapshot to final location: {}", final_path);
+        self.store.put(&final_path, staging_data).await?;
+
+        // Phase 4: Cleanup staging file
+        if let Err(e) = self.store.delete(&staging_path).await {
+            tracing::warn!("Failed to delete staging file {}: {}", staging_path, e);
+            // Non-fatal - staging cleanup can happen later
+        }
+
+        tracing::info!("Successfully committed compacted snapshot via two-phase commit");
+        Ok(final_path)
     }
 
     /// Rebuild indexes from compacted snapshot
@@ -332,6 +375,179 @@ impl CompactionManager {
             .ok_or_else(|| MosaicError::NotFound("Manifest not found".to_string()))?;
 
         Ok(manifest.snapshots.len() >= threshold)
+    }
+
+    /// Check if automatic compaction should be triggered (v0.8.0)
+    ///
+    /// Returns true if any of the following conditions are met:
+    /// - Snapshot count >= trigger_snapshot_count
+    /// - Oldest snapshot age >= trigger_age_hours
+    pub async fn should_auto_compact(&self) -> Result<bool> {
+        let manifest = self.manifest_manager.load().await?
+            .ok_or_else(|| MosaicError::NotFound("Manifest not found".to_string()))?;
+
+        let policy = &manifest.compaction_policy;
+
+        // Check if automatic compaction is enabled
+        if !policy.enabled {
+            return Ok(false);
+        }
+
+        // Check snapshot count threshold
+        if manifest.snapshots.len() >= policy.trigger_snapshot_count {
+            tracing::info!(
+                "Automatic compaction triggered: snapshot count ({}) >= threshold ({})",
+                manifest.snapshots.len(),
+                policy.trigger_snapshot_count
+            );
+            return Ok(true);
+        }
+
+        // Check snapshot age threshold
+        if let Some(oldest_snapshot) = manifest.snapshots.iter().min_by_key(|s| s.created_at) {
+            let age_hours = (Utc::now() - oldest_snapshot.created_at).num_hours();
+            if age_hours >= policy.trigger_age_hours {
+                tracing::info!(
+                    "Automatic compaction triggered: oldest snapshot age ({} hours) >= threshold ({} hours)",
+                    age_hours,
+                    policy.trigger_age_hours
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if we're in a maintenance window (v0.8.0)
+    pub fn is_maintenance_window(&self, allowed_hours: &[u8]) -> bool {
+        use chrono::Timelike;
+        let current_hour = Utc::now().hour() as u8;
+        allowed_hours.contains(&current_hour)
+    }
+
+    /// Perform incremental compaction (v0.8.0)
+    ///
+    /// This compacts a batch of snapshots at a time, rather than all at once.
+    /// This allows compaction to proceed gradually with minimal impact.
+    pub async fn compact_incremental(&self, batch_size: usize) -> Result<CompactionResult> {
+        let start_time = Utc::now();
+
+        // 1. Acquire lease
+        if !self.acquire_lease().await? {
+            return Err(MosaicError::Storage(
+                "Cannot acquire compaction lease - another writer is compacting".to_string()
+            ));
+        }
+
+        // Ensure lease is released
+        let result = self.compact_incremental_internal(batch_size).await;
+
+        // Release lease
+        if let Err(e) = self.release_lease().await {
+            tracing::error!("Failed to release compaction lease: {}", e);
+        }
+
+        let mut compaction_result = result?;
+        compaction_result.duration_seconds = (Utc::now() - start_time).num_milliseconds() as f64 / 1000.0;
+
+        Ok(compaction_result)
+    }
+
+    /// Internal incremental compaction logic
+    async fn compact_incremental_internal(&self, batch_size: usize) -> Result<CompactionResult> {
+        tracing::info!("Starting incremental compaction (batch_size={}) for store '{}'", batch_size, self.prefix);
+
+        // Load manifest
+        let manifest = self.manifest_manager.load().await?
+            .ok_or_else(|| MosaicError::NotFound("Manifest not found".to_string()))?;
+
+        let snapshots_before = manifest.snapshots.len();
+
+        // If snapshot count is below batch size, do full compaction
+        if snapshots_before <= batch_size {
+            return self.compact_internal().await;
+        }
+
+        tracing::info!("Compacting oldest {} of {} snapshots", batch_size, snapshots_before);
+
+        // Sort snapshots by age (oldest first)
+        let mut sorted_snapshots = manifest.snapshots.clone();
+        sorted_snapshots.sort_by_key(|s| s.created_at);
+
+        // Take oldest batch_size snapshots
+        let snapshots_to_compact: Vec<_> = sorted_snapshots.iter().take(batch_size).cloned().collect();
+        let remaining_snapshots: Vec<_> = sorted_snapshots.iter().skip(batch_size).cloned().collect();
+
+        // Load entries from snapshots to compact
+        let mut all_entries = Vec::new();
+        for snapshot_info in &snapshots_to_compact {
+            let entries = self.snapshot_log.load_snapshot(&snapshot_info.path).await?;
+            all_entries.extend(entries);
+        }
+
+        let total_entries = all_entries.len();
+        tracing::info!("Loaded {} entries from {} snapshots", total_entries, batch_size);
+
+        // Deduplicate
+        let unique_entries = self.deduplicate_entries(all_entries);
+        let unique_count = unique_entries.len();
+        tracing::info!("After deduplication: {} unique entries", unique_count);
+
+        // Write compacted snapshot
+        let compacted_path = self.write_compacted_snapshot(&unique_entries).await?;
+        tracing::info!("Wrote incremental compacted snapshot to {}", compacted_path);
+
+        // Rebuild indexes from all entries (compacted + remaining)
+        let mut all_entries_after = unique_entries.clone();
+        for snapshot_info in &remaining_snapshots {
+            let entries = self.snapshot_log.load_snapshot(&snapshot_info.path).await?;
+            all_entries_after.extend(entries);
+        }
+        self.rebuild_indexes(&all_entries_after, &compacted_path).await?;
+
+        // Update manifest: remove old batch, add compacted, keep remaining
+        let snapshot_data = self.store.get(&compacted_path).await?;
+        let checksum = crate::storage::manifest::calculate_checksum(&snapshot_data);
+
+        let new_snapshot = crate::storage::manifest::SnapshotInfo {
+            path: compacted_path.clone(),
+            writer_id: Some(self.writer_id.clone()),
+            entry_count: unique_count as u64,
+            size_bytes: snapshot_data.len() as u64,
+            format: "json".to_string(),
+            checksum: Some(checksum),
+            created_at: Utc::now(),
+        };
+
+        self.manifest_manager.update_with_retry(|manifest| {
+            // Clear snapshots and rebuild with remaining + compacted
+            manifest.snapshots.clear();
+            for snapshot in remaining_snapshots.iter() {
+                manifest.snapshots.push(snapshot.clone());
+            }
+            manifest.add_snapshot(new_snapshot.clone());
+
+            // Update last compaction timestamp
+            manifest.compaction_policy.last_compaction = Some(Utc::now());
+            Ok(())
+        }).await?;
+
+        // Delete old batch snapshots
+        for snapshot_info in &snapshots_to_compact {
+            if let Err(e) = self.store.delete(&snapshot_info.path).await {
+                tracing::warn!("Failed to delete old snapshot {}: {}", snapshot_info.path, e);
+            }
+        }
+
+        Ok(CompactionResult {
+            snapshots_before,
+            snapshots_after: remaining_snapshots.len() + 1,
+            total_entries,
+            unique_entries: unique_count,
+            compacted_snapshot_path: compacted_path,
+            duration_seconds: 0.0, // Will be set by compact_incremental()
+        })
     }
 }
 

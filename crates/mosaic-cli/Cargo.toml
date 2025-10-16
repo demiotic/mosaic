@@ -1,0 +1,47 @@
+[package]
+name = "mosaic-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for Mosaic"
+
+[[bin]]
+name = "mosaic"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+mosaic-core = { path = "../mosaic-core", features = ["backend-local", "backend-memory", "backend-s3"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+
+# CLI framework
+clap = { version = "4.5", features = ["derive", "env", "cargo"] }
+clap_complete = "4.5"
+
+# Terminal UI
+indicatif = "0.17"
+console = "0.15"
+dialoguer = "0.11"
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Table formatting
+tabled = "0.16"
+
+# Config file support
+toml = "0.8"
+dirs = "5.0"
+
+# Archive support for export/import
+tar = "0.4"
+flate2 = "1.0"

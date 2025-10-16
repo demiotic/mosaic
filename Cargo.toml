@@ -1,14 +1,14 @@
 [workspace]
 members = [
     "crates/mosaic-core",
+    "crates/mosaic-cli",
     # Future crates:
     # "crates/mosaic-py",
-    # "crates/mosaic-cli",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Juan José de las Heras Herrera"]
 license = "MIT OR Apache-2.0"

@@ -55,7 +55,22 @@ backend-memory = []
 tracing-subscriber.workspace = true
 tempfile = "3.14"
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+uuid = { version = "1.11", features = ["v4"] }
 
 [[example]]
 name = "resilience"
 path = "../../examples/resilience.rs"
+
+[[example]]
+name = "multimodal"
+path = "../../examples/multimodal.rs"
+
+[[example]]
+name = "multi_writer"
+path = "../../examples/multi_writer.rs"
+
+[[bench]]
+name = "store_benchmarks"
+path = "../../benches/store_benchmarks.rs"
+harness = false

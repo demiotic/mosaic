@@ -1,0 +1,6 @@
+[book]
+authors = ["Juanjo"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Mosaic Documentation"

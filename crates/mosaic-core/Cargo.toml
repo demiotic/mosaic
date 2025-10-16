@@ -52,3 +52,7 @@ backend-memory = []
 tracing-subscriber.workspace = true
 tempfile = "3.14"
 tokio-test = "0.4"
+
+[[example]]
+name = "resilience"
+path = "../../examples/resilience.rs"

@@ -1,6 +1,6 @@
 //! Mosaic Core - Storage format for distributed memory systems
 //!
-//! Version: 0.5.0 - "Multi-Writer (Optimistic Locking)"
+//! Version: 0.7.0 - "Circuit Breaker & Resilience"
 //!
 //! This crate provides the core functionality for Mosaic:
 //! - Content-addressed blob storage
@@ -10,6 +10,9 @@
 //! - Write-Ahead Log (WAL) for crash safety
 //! - Type-safe feature detection API
 //! - Multiple storage backends (S3, Local, Memory, Azure, GCS)
+//! - Circuit breaker for S3 resilience
+//! - Rate limiting (token bucket)
+//! - Metrics and observability
 //!
 //! # Example
 //!
@@ -64,13 +67,20 @@
 pub mod capabilities;
 pub mod concurrency;
 pub mod error;
+pub mod observability;
 pub mod storage;
 pub mod store;
 pub mod types;
 
 // Re-export main types for convenience
 pub use capabilities::{Capabilities, DegradationPolicy, Feature, FeatureInfo};
-pub use concurrency::{RetryPolicy, retry_with_backoff};
+pub use concurrency::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitState, RateLimiter, RateLimiterConfig,
+    RetryPolicy, retry_with_backoff,
+};
 pub use error::{MosaicError, Result};
+pub use observability::{
+    HealthCheckResult, HealthStatus, HealthThresholds, MetricsCollector,
+};
 pub use store::MosaicStore;
 pub use types::{Entry, EntryId, EntryMetadata};

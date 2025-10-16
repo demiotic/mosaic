@@ -1,0 +1,53 @@
+[package]
+name = "mosaic-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for Mosaic - S3-native storage format"
+
+[lib]
+name = "mosaic_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace dependencies
+arrow.workspace = true
+parquet.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes = "1.10"
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+ulid.workspace = true
+tracing.workspace = true
+
+# Async trait support
+async-trait = "0.1"
+
+# Utility
+md5 = "0.7"
+
+# Backend-specific dependencies (feature-gated)
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+default = ["backend-local", "backend-memory"]
+
+# Storage backends
+backend-s3 = ["aws-config", "aws-sdk-s3"]
+backend-azure = []  # TODO: Add azure-storage-blobs when implemented
+backend-gcs = []    # TODO: Add google-cloud-storage when implemented
+backend-local = []
+backend-memory = []
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tempfile = "3.14"
+tokio-test = "0.4"

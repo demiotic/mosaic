@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo.lock should be ignored for libraries (but committed for binaries)
+# Uncommenting this if you want to ignore it:
+# Cargo.lock
+
+# Debug artifacts
+**/*.rs.bk
+*.pdb
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local test data
+my-data/
+test-data/
+*.db
+*.sqlite
+

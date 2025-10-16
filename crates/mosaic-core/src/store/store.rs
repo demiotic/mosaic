@@ -10,42 +10,96 @@ use crate::storage::blobs::{
     deserialize_parquet_to_record_batch, serialize_record_batch_to_parquet, BlobStorage,
 };
 use crate::storage::indexes::{IndexManager, IndexStats};
+use crate::storage::manifest::{IndexInfo, Manifest, ManifestManager, SnapshotInfo};
 use crate::storage::snapshots::SnapshotLog;
 use crate::types::{Entry, EntryId, EntryMetadata};
 
-/// Mosaic Store - v0.2.0 "Pre-Built Indexes"
+/// Mosaic Store - v0.3.0 "Manifest & Schema"
 ///
 /// Features:
 /// - Single-writer only
 /// - Tabular data only (Arrow → Parquet)
 /// - Content-addressed blob storage
 /// - Append-only snapshot log
-/// - **Exact-match queries (O(1) with index)**
-/// - **Time-range queries**
+/// - Exact-match queries (O(1) with index)
+/// - Time-range queries
+/// - **Manifest-based configuration** (v0.3.0)
+/// - **Forward-compatible schema** (v0.3.0)
+/// - **Reserved fields for future features** (v0.3.0)
 /// - Multiple storage backends (S3, Local, Memory, Azure, GCS)
 pub struct MosaicStore {
     blob_storage: BlobStorage,
     snapshot_log: SnapshotLog,
     index_manager: Arc<RwLock<IndexManager>>,
+    manifest_manager: ManifestManager,
+    manifest: Arc<RwLock<Manifest>>,
     store: Arc<dyn ObjectStore>,
     prefix: String,
 }
 
 impl MosaicStore {
-    /// Create a new Mosaic store with a storage backend
+    /// Create a new Mosaic store with a storage backend (v0.3.0)
+    ///
+    /// This will create a new manifest if one doesn't exist.
+    /// Use `load` to open an existing store.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
         let index_manager = Arc::new(RwLock::new(IndexManager::new(
             store.clone(),
             prefix.clone(),
         )));
 
+        let manifest_manager = ManifestManager::new(store.clone(), prefix.clone());
+
+        // Create a new manifest (will be saved on first operation)
+        let manifest = Manifest::new(prefix.clone());
+        let manifest = Arc::new(RwLock::new(manifest));
+
         Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
             snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
             index_manager,
+            manifest_manager,
+            manifest,
             store,
             prefix,
         }
+    }
+
+    /// Load an existing Mosaic store from storage (v0.3.0)
+    ///
+    /// If no manifest exists, creates a new one.
+    pub async fn load(store: Arc<dyn ObjectStore>, prefix: String) -> Result<Self> {
+        let index_manager = Arc::new(RwLock::new(IndexManager::new(
+            store.clone(),
+            prefix.clone(),
+        )));
+
+        let manifest_manager = ManifestManager::new(store.clone(), prefix.clone());
+
+        // Load or create manifest
+        let manifest = match manifest_manager.load().await? {
+            Some(m) => {
+                tracing::info!("Loaded existing manifest for store '{}'", m.store_id);
+                m
+            }
+            None => {
+                tracing::info!("No manifest found, creating new store '{}'", prefix);
+                let m = manifest_manager.create(prefix.clone()).await?;
+                m
+            }
+        };
+
+        let manifest = Arc::new(RwLock::new(manifest));
+
+        Ok(Self {
+            blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
+            snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
+            index_manager,
+            manifest_manager,
+            manifest,
+            store,
+            prefix,
+        })
     }
 
     /// Load indexes on startup (v0.2.0)
@@ -94,25 +148,50 @@ impl MosaicStore {
         // 4. Store blob with content-addressed naming
         let (blob_hash, blob_path) = self.blob_storage.store_blob(&parquet_bytes).await?;
 
-        // 5. Create entry metadata
+        // 5. Create entry metadata (v0.3.0: with context, tags, and reserved fields)
         let entry = Entry {
             entry_id: entry_id.clone(),
             query_text: query.to_string(),
             query_hash,
+            context: None,  // v0.3.0: Optional structured context
+            tags: None,     // v0.3.0: Optional key-value tags
             blob_hash,
             blob_path,
             size_bytes: parquet_bytes.len() as u64,
             created_at: Utc::now(),
+            // Reserved fields for forward compatibility (v0.3.0+)
+            _version: None,
+            _operation_id: None,
+            _transaction_state: None,
+            _previous_entry_id: None,
+            extensions: None,
         };
 
-        // 6. Append to snapshot log
-        let snapshot_path = self.snapshot_log.append_entry(entry.clone()).await?;
+        // 6. Append to snapshot log (v0.3.0: with checksum)
+        let (snapshot_path, snapshot_checksum) = self.snapshot_log.append_entry(entry.clone()).await?;
 
         // 7. Update indexes in memory (v0.2.0)
         {
             let mut index_mgr = self.index_manager.write().await;
             index_mgr.build_indexes(vec![entry], &snapshot_path)?;
         }
+
+        // 8. Update manifest with snapshot info (v0.3.0)
+        {
+            let mut manifest = self.manifest.write().await;
+            let snapshot_info = SnapshotInfo {
+                path: snapshot_path.clone(),
+                entry_count: 1,
+                size_bytes: parquet_bytes.len() as u64,
+                format: "json".to_string(),
+                checksum: Some(snapshot_checksum),
+                created_at: Utc::now(),
+            };
+            manifest.add_snapshot(snapshot_info);
+        }
+
+        // 9. Persist manifest
+        self.persist_manifest().await?;
 
         tracing::info!("Successfully stored entry: {}", entry_id);
 
@@ -126,8 +205,47 @@ impl MosaicStore {
         let query_hash_index_path = format!("{}/indexes/query_hash.parquet", self.prefix);
         let created_at_index_path = format!("{}/indexes/created_at.parquet", self.prefix);
 
-        index_mgr.save_query_hash_index(&query_hash_index_path).await?;
-        index_mgr.save_created_at_index(&created_at_index_path).await?;
+        let query_hash_checksum = index_mgr.save_query_hash_index(&query_hash_index_path).await?;
+        let created_at_checksum = index_mgr.save_created_at_index(&created_at_index_path).await?;
+
+        // Update manifest with index info (v0.3.0)
+        if let Some(checksum) = query_hash_checksum {
+            let index_stats = index_mgr.get_stats();
+            let mut manifest = self.manifest.write().await;
+
+            let index_info = IndexInfo {
+                name: "query_hash".to_string(),
+                path: query_hash_index_path.clone(),
+                index_type: "hash".to_string(),
+                entry_count: index_stats.query_hash_entries as u64,
+                size_bytes: 0, // TODO: Get actual file size
+                checksum: Some(checksum),
+                updated_at: Utc::now(),
+            };
+
+            manifest.update_index(index_info);
+        }
+
+        if let Some(checksum) = created_at_checksum {
+            let index_stats = index_mgr.get_stats();
+            let mut manifest = self.manifest.write().await;
+
+            let index_info = IndexInfo {
+                name: "created_at".to_string(),
+                path: created_at_index_path.clone(),
+                index_type: "btree".to_string(),
+                entry_count: index_stats.created_at_entries as u64,
+                size_bytes: 0, // TODO: Get actual file size
+                checksum: Some(checksum),
+                updated_at: Utc::now(),
+            };
+
+            manifest.update_index(index_info);
+        }
+
+        // Persist manifest
+        drop(index_mgr);
+        self.persist_manifest().await?;
 
         Ok(())
     }
@@ -271,6 +389,13 @@ impl MosaicStore {
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
+    }
+
+    /// Persist manifest to storage (v0.3.0)
+    async fn persist_manifest(&self) -> Result<()> {
+        let manifest = self.manifest.read().await;
+        self.manifest_manager.save(&manifest).await?;
+        Ok(())
     }
 }
 

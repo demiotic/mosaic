@@ -109,9 +109,11 @@ impl IndexManager {
     }
 
     /// Save query hash index to Parquet
-    pub async fn save_query_hash_index(&self, path: &str) -> Result<()> {
+    ///
+    /// Returns checksum of saved index (v0.3.0)
+    pub async fn save_query_hash_index(&self, path: &str) -> Result<Option<String>> {
         if self.query_hash_index.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // Convert to Arrow RecordBatch
@@ -145,22 +147,28 @@ impl IndexManager {
         // Serialize to Parquet
         let parquet_bytes = serialize_record_batch_to_parquet(&batch)?;
 
+        // Compute checksum (v0.3.0)
+        let checksum = crate::storage::manifest::calculate_checksum(&parquet_bytes);
+
         // Upload to storage
         self.store.put(path, parquet_bytes).await?;
 
         tracing::info!(
-            "Saved query hash index with {} entries to {}",
+            "Saved query hash index with {} entries to {} (checksum: {})",
             self.query_hash_index.len(),
-            path
+            path,
+            checksum
         );
 
-        Ok(())
+        Ok(Some(checksum))
     }
 
     /// Save created_at index to Parquet
-    pub async fn save_created_at_index(&self, path: &str) -> Result<()> {
+    ///
+    /// Returns checksum of saved index (v0.3.0)
+    pub async fn save_created_at_index(&self, path: &str) -> Result<Option<String>> {
         if self.created_at_index.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // Convert to Arrow RecordBatch
@@ -195,16 +203,20 @@ impl IndexManager {
         // Serialize to Parquet
         let parquet_bytes = serialize_record_batch_to_parquet(&batch)?;
 
+        // Compute checksum (v0.3.0)
+        let checksum = crate::storage::manifest::calculate_checksum(&parquet_bytes);
+
         // Upload to storage
         self.store.put(path, parquet_bytes).await?;
 
         tracing::info!(
-            "Saved created_at index with {} entries to {}",
+            "Saved created_at index with {} entries to {} (checksum: {})",
             self.created_at_index.len(),
-            path
+            path,
+            checksum
         );
 
-        Ok(())
+        Ok(Some(checksum))
     }
 
     /// Load query hash index from Parquet
@@ -344,25 +356,39 @@ mod tests {
 
         let mut index_manager = IndexManager::new(Arc::new(backend.clone()), "test".to_string());
 
-        // Create test entries
+        // Create test entries (v0.3.0: with context, tags, and reserved fields)
         let entries = vec![
             Entry {
                 entry_id: "entry1".to_string(),
                 query_text: "query1".to_string(),
                 query_hash: "hash1".to_string(),
+                context: None,
+                tags: None,
                 blob_hash: "blob1".to_string(),
                 blob_path: "path1".to_string(),
                 size_bytes: 100,
                 created_at: Utc::now(),
+                _version: None,
+                _operation_id: None,
+                _transaction_state: None,
+                _previous_entry_id: None,
+                extensions: None,
             },
             Entry {
                 entry_id: "entry2".to_string(),
                 query_text: "query2".to_string(),
                 query_hash: "hash2".to_string(),
+                context: None,
+                tags: None,
                 blob_hash: "blob2".to_string(),
                 blob_path: "path2".to_string(),
                 size_bytes: 200,
                 created_at: Utc::now(),
+                _version: None,
+                _operation_id: None,
+                _transaction_state: None,
+                _previous_entry_id: None,
+                extensions: None,
             },
         ];
 

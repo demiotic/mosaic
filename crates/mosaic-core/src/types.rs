@@ -4,6 +4,48 @@ use serde::{Deserialize, Serialize};
 /// Unique identifier for an entry (ULID - time-ordered)
 pub type EntryId = String;
 
+/// Result of a get operation (v0.9.0)
+///
+/// For large blobs, returns a presigned URL.
+/// For small blobs, returns inline content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GetResult {
+    /// Presigned URL for large blobs (> 1MB)
+    PresignedUrl {
+        url: String,
+        ttl_seconds: u64,
+        entry: Entry,
+    },
+    /// Inline content for small blobs (<= 1MB)
+    Inline {
+        content: Vec<u8>,
+        entry: Entry,
+    },
+}
+
+impl GetResult {
+    /// Get the entry metadata
+    pub fn entry(&self) -> &Entry {
+        match self {
+            GetResult::PresignedUrl { entry, .. } => entry,
+            GetResult::Inline { entry, .. } => entry,
+        }
+    }
+
+    /// Check if result is a presigned URL
+    pub fn is_presigned_url(&self) -> bool {
+        matches!(self, GetResult::PresignedUrl { .. })
+    }
+
+    /// Check if result is inline content
+    pub fn is_inline(&self) -> bool {
+        matches!(self, GetResult::Inline { .. })
+    }
+}
+
+/// Threshold for inline vs presigned URL (1MB)
+pub const INLINE_THRESHOLD_BYTES: u64 = 1_048_576;
+
 /// Entry metadata stored in snapshots
 ///
 /// v0.3.0: Added reserved fields for forward compatibility
@@ -36,6 +78,15 @@ pub struct Entry {
     pub blob_hash: String,  // SHA256 of content
     pub blob_path: String,  // S3 path to blob
     pub size_bytes: u64,
+
+    /// Content type (v0.9.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+
+    /// Compression format (v0.9.0): "none", "zstd", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+
     pub created_at: DateTime<Utc>,
 
     /// Reserved fields for forward compatibility (v0.3.0+)

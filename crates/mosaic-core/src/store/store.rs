@@ -10,6 +10,7 @@ use crate::storage::backend::ObjectStore;
 use crate::storage::blobs::{
     deserialize_parquet_to_record_batch, serialize_record_batch_to_parquet, BlobStorage,
 };
+use crate::storage::compression::CompressionFormat;
 use crate::storage::compaction::{CompactionManager, CompactionResult};
 use crate::storage::indexes::{IndexManager, IndexStats};
 use crate::storage::manifest::{IndexInfo, Manifest, ManifestManager, SnapshotInfo};
@@ -17,28 +18,22 @@ use crate::storage::snapshots::SnapshotLog;
 use crate::storage::wal::WalManager;
 use crate::types::{Entry, EntryId, EntryMetadata};
 
-/// Mosaic Store - v0.6.0 "Compaction"
+/// Mosaic Store - v0.9.0 "Multi-Modal Content"
 ///
 /// Features:
+/// - **Multi-modal content support** (v0.9.0)
+/// - **Automatic content type detection** (v0.9.0)
+/// - **Compression (zstd) for compressible formats** (v0.9.0)
+/// - **Presigned URL generation for large blobs** (v0.9.0)
+/// - **Automatic compaction & GC** (v0.8.0)
+/// - **Circuit breaker & resilience** (v0.7.0)
 /// - **Manual compaction with lease coordination** (v0.6.0)
-/// - **Snapshot merging and deduplication** (v0.6.0)
-/// - **Index rebuilding from compacted snapshots** (v0.6.0)
-/// - **Atomic manifest swap with two-phase commit** (v0.6.0)
 /// - **Multi-writer support with optimistic locking** (v0.5.0)
-/// - **Per-writer snapshot files** (v0.5.0)
-/// - **Exponential backoff with jitter for retries** (v0.5.0)
-/// - **Conflict resolution (last write wins)** (v0.5.0)
-/// - Tabular data only (Arrow → Parquet)
-/// - Content-addressed blob storage
-/// - Append-only snapshot log with pre-built indexes
-/// - Exact-match queries (O(1) with index)
-/// - Time-range queries
-/// - **Manifest-based configuration** (v0.3.0)
-/// - **Forward-compatible schema** (v0.3.0)
-/// - **Reserved fields for future features** (v0.3.0)
 /// - **Write-Ahead Log (WAL) for crash safety** (v0.4.0)
-/// - **Heartbeat tracking and stale cleanup** (v0.4.0)
-/// - **Type-safe feature detection API** (v0.4.0)
+/// - **Forward-compatible schema** (v0.3.0)
+/// - **Pre-built indexes (query_hash, created_at)** (v0.2.0)
+/// - Content-addressed blob storage with deduplication
+/// - Append-only snapshot log
 /// - Multiple storage backends (S3, Local, Memory, Azure, GCS)
 pub struct MosaicStore {
     blob_storage: BlobStorage,
@@ -95,8 +90,8 @@ impl MosaicStore {
             None
         };
 
-        // Initialize capabilities for v0.6.0
-        let capabilities = Self::initialize_capabilities("0.6.0", enable_wal);
+        // Initialize capabilities for v0.9.0
+        let capabilities = Self::initialize_capabilities("0.9.0", enable_wal);
 
         Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
@@ -183,7 +178,7 @@ impl MosaicStore {
         };
 
         // Initialize capabilities
-        let capabilities = Self::initialize_capabilities("0.6.0", enable_wal);
+        let capabilities = Self::initialize_capabilities("0.9.0", enable_wal);
 
         Ok(Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
@@ -250,28 +245,30 @@ impl MosaicStore {
         // 3. Serialize RecordBatch to Parquet
         let parquet_bytes = serialize_record_batch_to_parquet(&content)?;
 
-        // 4. Store blob with content-addressed naming
-        // The BlobStorage will calculate the hash and path
-        let (blob_hash, blob_path) = self.blob_storage.store_blob(&parquet_bytes).await?;
+        // 4. Store blob with content-addressed naming (v0.9.0: with content type detection)
+        // The BlobStorage will calculate the hash, path, and detect content type
+        let blob_result = self.blob_storage.store_blob(&parquet_bytes).await?;
 
         // 5. WAL: Register pending write AFTER blob is stored (v0.4.0)
         // This ensures the blob exists before we commit to the WAL
         if let Some(wal) = &self.wal_manager {
-            wal.register_pending(entry_id.clone(), vec![blob_path.clone()])
+            wal.register_pending(entry_id.clone(), vec![blob_result.blob_path.clone()])
                 .await?;
             tracing::debug!("Registered pending write in WAL: {}", entry_id);
         }
 
-        // 6. Create entry metadata (v0.3.0: with context, tags, and reserved fields)
+        // 6. Create entry metadata (v0.9.0: with content_type and compression)
         let entry = Entry {
             entry_id: entry_id.clone(),
             query_text: query.to_string(),
             query_hash,
             context: None,  // v0.3.0: Optional structured context
             tags: None,     // v0.3.0: Optional key-value tags
-            blob_hash: blob_hash.clone(),
-            blob_path: blob_path.clone(),
-            size_bytes: parquet_bytes.len() as u64,
+            blob_hash: blob_result.blob_hash.clone(),
+            blob_path: blob_result.blob_path.clone(),
+            size_bytes: blob_result.original_size,
+            content_type: Some(blob_result.content_type.to_string()), // v0.9.0
+            compression: Some(format!("{:?}", blob_result.compression).to_lowercase()), // v0.9.0
             created_at: Utc::now(),
             // Reserved fields for forward compatibility (v0.3.0+)
             _version: None,
@@ -428,8 +425,13 @@ impl MosaicStore {
                 ))
             })?;
 
-        // 4. Fetch blob from storage
-        let blob_bytes = self.blob_storage.get_blob(&entry.blob_path).await?;
+        // 4. Fetch blob from storage (v0.9.0: with decompression)
+        let compression = entry.compression.as_deref().unwrap_or("none");
+        let compression_format = match compression {
+            "zstd" => CompressionFormat::Zstd,
+            _ => CompressionFormat::None,
+        };
+        let blob_bytes = self.blob_storage.get_blob(&entry.blob_path, compression_format).await?;
 
         // 5. Deserialize Parquet to RecordBatch
         let record_batch = deserialize_parquet_to_record_batch(&blob_bytes)?;
@@ -842,7 +844,7 @@ mod tests {
 
         // Check capabilities
         let caps = store_with_wal.get_capabilities();
-        assert_eq!(caps.version, "0.6.0");
+        assert_eq!(caps.version, "0.9.0");
         assert!(caps.supports(Feature::Wal));
 
         // Check feature info

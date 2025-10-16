@@ -34,6 +34,9 @@ async-trait = "0.1"
 md5 = "0.7"
 rand.workspace = true
 
+# Compression (v0.9.0)
+zstd.workspace = true
+
 # Backend-specific dependencies (feature-gated)
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

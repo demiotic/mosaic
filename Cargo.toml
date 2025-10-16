@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Juan José de las Heras Herrera"]
 license = "MIT OR Apache-2.0"
@@ -50,6 +50,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Random (for jitter in retries)
 rand = "0.8"
+
+# Compression (for multi-modal content, v0.9.0)
+zstd = "0.13"
 
 [profile.release]
 lto = true

@@ -373,6 +373,8 @@ mod tests {
                 _transaction_state: None,
                 _previous_entry_id: None,
                 extensions: None,
+                content_type: None,
+                compression: None,
             },
             Entry {
                 entry_id: "entry2".to_string(),
@@ -389,6 +391,8 @@ mod tests {
                 _transaction_state: None,
                 _previous_entry_id: None,
                 extensions: None,
+                content_type: None,
+                compression: None,
             },
         ];
 

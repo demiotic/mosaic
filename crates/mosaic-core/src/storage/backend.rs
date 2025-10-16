@@ -74,6 +74,28 @@ pub trait ObjectStore: Send + Sync + Debug {
 
     /// Get partial object data (range request)
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>>;
+
+    /// Generate presigned URL for GET operation (v0.9.0)
+    ///
+    /// Returns a URL that can be used to download the object without authentication.
+    /// Default implementation returns an error (not all backends support presigned URLs).
+    ///
+    /// # Arguments
+    /// * `key` - Object key
+    /// * `ttl_seconds` - Time to live for the URL in seconds
+    ///
+    /// # Returns
+    /// * Presigned URL string, or None if backend doesn't support presigned URLs
+    async fn generate_presigned_url(&self, key: &str, ttl_seconds: u64) -> Result<Option<String>> {
+        // Default implementation: presigned URLs not supported
+        tracing::warn!(
+            "Presigned URLs not supported for backend: {:?}, key: {}",
+            self,
+            key
+        );
+        let _ = ttl_seconds; // Suppress unused warning
+        Ok(None)
+    }
 }
 
 /// Builder for creating object store instances

@@ -170,6 +170,8 @@ mod tests {
             _transaction_state: None,
             _previous_entry_id: None,
             extensions: None,
+                content_type: None,
+                compression: None,
         };
 
         let snapshot = Snapshot {
@@ -215,6 +217,8 @@ mod tests {
             _transaction_state: None,
             _previous_entry_id: None,
             extensions: None,
+                content_type: None,
+                compression: None,
         };
 
         // Append entry and get checksum

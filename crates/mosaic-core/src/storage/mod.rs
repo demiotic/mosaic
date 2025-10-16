@@ -2,6 +2,8 @@ pub mod backend;
 pub mod backends;
 pub mod blobs;
 pub mod compaction;
+pub mod compression;
+pub mod content_types;
 pub mod gc;
 pub mod indexes;
 pub mod manifest;

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::capabilities::{Capabilities, Feature, FeatureInfo};
 use crate::error::{MosaicError, Result};
 use crate::storage::backend::ObjectStore;
 use crate::storage::blobs::{
@@ -12,20 +13,24 @@ use crate::storage::blobs::{
 use crate::storage::indexes::{IndexManager, IndexStats};
 use crate::storage::manifest::{IndexInfo, Manifest, ManifestManager, SnapshotInfo};
 use crate::storage::snapshots::SnapshotLog;
+use crate::storage::wal::WalManager;
 use crate::types::{Entry, EntryId, EntryMetadata};
 
-/// Mosaic Store - v0.3.0 "Manifest & Schema"
+/// Mosaic Store - v0.4.0 "WAL & Crash Safety + Feature Detection"
 ///
 /// Features:
 /// - Single-writer only
 /// - Tabular data only (Arrow → Parquet)
 /// - Content-addressed blob storage
-/// - Append-only snapshot log
+/// - Append-only snapshot log with pre-built indexes
 /// - Exact-match queries (O(1) with index)
 /// - Time-range queries
 /// - **Manifest-based configuration** (v0.3.0)
 /// - **Forward-compatible schema** (v0.3.0)
 /// - **Reserved fields for future features** (v0.3.0)
+/// - **Write-Ahead Log (WAL) for crash safety** (v0.4.0)
+/// - **Heartbeat tracking and stale cleanup** (v0.4.0)
+/// - **Type-safe feature detection API** (v0.4.0)
 /// - Multiple storage backends (S3, Local, Memory, Azure, GCS)
 pub struct MosaicStore {
     blob_storage: BlobStorage,
@@ -33,16 +38,32 @@ pub struct MosaicStore {
     index_manager: Arc<RwLock<IndexManager>>,
     manifest_manager: ManifestManager,
     manifest: Arc<RwLock<Manifest>>,
+    wal_manager: Option<WalManager>,
+    capabilities: Capabilities,
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    writer_id: String,
 }
 
 impl MosaicStore {
-    /// Create a new Mosaic store with a storage backend (v0.3.0)
+    /// Create a new Mosaic store with a storage backend (v0.4.0)
     ///
     /// This will create a new manifest if one doesn't exist.
     /// Use `load` to open an existing store.
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
+    ///
+    /// # Arguments
+    /// * `store` - Storage backend
+    /// * `prefix` - Store prefix/name
+    /// * `writer_id` - Unique writer identifier (defaults to ULID)
+    /// * `enable_wal` - Enable Write-Ahead Log for crash safety
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        writer_id: Option<String>,
+        enable_wal: bool,
+    ) -> Self {
+        let writer_id = writer_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+
         let index_manager = Arc::new(RwLock::new(IndexManager::new(
             store.clone(),
             prefix.clone(),
@@ -54,21 +75,66 @@ impl MosaicStore {
         let manifest = Manifest::new(prefix.clone());
         let manifest = Arc::new(RwLock::new(manifest));
 
+        // Create WAL manager if enabled
+        let wal_manager = if enable_wal {
+            Some(WalManager::new(
+                store.clone(),
+                prefix.clone(),
+                writer_id.clone(),
+                None, // Use default TTL
+            ))
+        } else {
+            None
+        };
+
+        // Initialize capabilities for v0.4.0
+        let capabilities = Self::initialize_capabilities("0.4.0", enable_wal);
+
         Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
             snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
             index_manager,
             manifest_manager,
             manifest,
+            wal_manager,
+            capabilities,
             store,
             prefix,
+            writer_id,
         }
     }
 
-    /// Load an existing Mosaic store from storage (v0.3.0)
+    /// Initialize capabilities based on version and features
+    fn initialize_capabilities(version: &str, wal_enabled: bool) -> Capabilities {
+        let mut caps = Capabilities::new(version.to_string());
+
+        // Enable/disable features based on actual configuration
+        if wal_enabled {
+            caps.enable_feature(Feature::Wal, version.to_string());
+        } else {
+            caps.disable_feature(Feature::Wal);
+        }
+
+        caps
+    }
+
+    /// Load an existing Mosaic store from storage (v0.4.0)
     ///
     /// If no manifest exists, creates a new one.
-    pub async fn load(store: Arc<dyn ObjectStore>, prefix: String) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `store` - Storage backend
+    /// * `prefix` - Store prefix/name
+    /// * `writer_id` - Unique writer identifier (defaults to ULID)
+    /// * `enable_wal` - Enable Write-Ahead Log for crash safety
+    pub async fn load(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        writer_id: Option<String>,
+        enable_wal: bool,
+    ) -> Result<Self> {
+        let writer_id = writer_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+
         let index_manager = Arc::new(RwLock::new(IndexManager::new(
             store.clone(),
             prefix.clone(),
@@ -91,14 +157,37 @@ impl MosaicStore {
 
         let manifest = Arc::new(RwLock::new(manifest));
 
+        // Create WAL manager if enabled
+        let wal_manager = if enable_wal {
+            let wal = WalManager::new(
+                store.clone(),
+                prefix.clone(),
+                writer_id.clone(),
+                None, // Use default TTL
+            );
+
+            // Initialize WAL (register writer, load pending writes)
+            wal.initialize().await?;
+
+            Some(wal)
+        } else {
+            None
+        };
+
+        // Initialize capabilities
+        let capabilities = Self::initialize_capabilities("0.4.0", enable_wal);
+
         Ok(Self {
             blob_storage: BlobStorage::new(store.clone(), prefix.clone()),
             snapshot_log: SnapshotLog::new(store.clone(), prefix.clone()),
             index_manager,
             manifest_manager,
             manifest,
+            wal_manager,
+            capabilities,
             store,
             prefix,
+            writer_id,
         })
     }
 
@@ -125,7 +214,7 @@ impl MosaicStore {
         Ok(())
     }
 
-    /// Store a new entry
+    /// Store a new entry (v0.4.0 with WAL support)
     ///
     /// # Arguments
     /// * `content` - Arrow RecordBatch to store
@@ -133,30 +222,47 @@ impl MosaicStore {
     ///
     /// # Returns
     /// * `EntryId` - Unique identifier for the entry (ULID)
+    ///
+    /// # WAL Integration (v0.4.0)
+    /// If WAL is enabled:
+    /// 1. Register pending write in WAL
+    /// 2. Write blob to storage
+    /// 3. Write snapshot
+    /// 4. Remove from WAL (success)
+    /// 5. Update heartbeat
     pub async fn store_entry(&self, content: RecordBatch, query: &str) -> Result<EntryId> {
-        tracing::info!("Storing entry with query: {}", query);
+        tracing::info!("Storing entry with query: {} (writer: {})", query, self.writer_id);
 
         // 1. Generate entry ID (ULID - time-ordered)
         let entry_id = ulid::Ulid::new().to_string();
 
-        // 2. Calculate query hash (for future indexing)
+        // 2. Calculate query hash (for indexing)
         let query_hash = Self::calculate_hash(query.as_bytes());
 
         // 3. Serialize RecordBatch to Parquet
         let parquet_bytes = serialize_record_batch_to_parquet(&content)?;
 
         // 4. Store blob with content-addressed naming
+        // The BlobStorage will calculate the hash and path
         let (blob_hash, blob_path) = self.blob_storage.store_blob(&parquet_bytes).await?;
 
-        // 5. Create entry metadata (v0.3.0: with context, tags, and reserved fields)
+        // 5. WAL: Register pending write AFTER blob is stored (v0.4.0)
+        // This ensures the blob exists before we commit to the WAL
+        if let Some(wal) = &self.wal_manager {
+            wal.register_pending(entry_id.clone(), vec![blob_path.clone()])
+                .await?;
+            tracing::debug!("Registered pending write in WAL: {}", entry_id);
+        }
+
+        // 6. Create entry metadata (v0.3.0: with context, tags, and reserved fields)
         let entry = Entry {
             entry_id: entry_id.clone(),
             query_text: query.to_string(),
             query_hash,
             context: None,  // v0.3.0: Optional structured context
             tags: None,     // v0.3.0: Optional key-value tags
-            blob_hash,
-            blob_path,
+            blob_hash: blob_hash.clone(),
+            blob_path: blob_path.clone(),
             size_bytes: parquet_bytes.len() as u64,
             created_at: Utc::now(),
             // Reserved fields for forward compatibility (v0.3.0+)
@@ -167,16 +273,16 @@ impl MosaicStore {
             extensions: None,
         };
 
-        // 6. Append to snapshot log (v0.3.0: with checksum)
+        // 7. Append to snapshot log (v0.3.0: with checksum)
         let (snapshot_path, snapshot_checksum) = self.snapshot_log.append_entry(entry.clone()).await?;
 
-        // 7. Update indexes in memory (v0.2.0)
+        // 8. Update indexes in memory (v0.2.0)
         {
             let mut index_mgr = self.index_manager.write().await;
             index_mgr.build_indexes(vec![entry], &snapshot_path)?;
         }
 
-        // 8. Update manifest with snapshot info (v0.3.0)
+        // 9. Update manifest with snapshot info (v0.3.0)
         {
             let mut manifest = self.manifest.write().await;
             let snapshot_info = SnapshotInfo {
@@ -190,10 +296,19 @@ impl MosaicStore {
             manifest.add_snapshot(snapshot_info);
         }
 
-        // 9. Persist manifest
+        // 10. Persist manifest
         self.persist_manifest().await?;
 
-        tracing::info!("Successfully stored entry: {}", entry_id);
+        // 11. WAL: Remove pending write (success) (v0.4.0)
+        if let Some(wal) = &self.wal_manager {
+            wal.remove_pending(&entry_id).await?;
+            tracing::debug!("Removed pending write from WAL: {}", entry_id);
+
+            // Update heartbeat
+            wal.write_heartbeat().await?;
+        }
+
+        tracing::info!("Successfully stored entry: {} (writer: {})", entry_id, self.writer_id);
 
         Ok(entry_id)
     }
@@ -397,6 +512,101 @@ impl MosaicStore {
         self.manifest_manager.save(&manifest).await?;
         Ok(())
     }
+
+    /// Get store capabilities (v0.4.0)
+    ///
+    /// # Returns
+    /// * `Capabilities` - Store capabilities including version and feature availability
+    pub fn get_capabilities(&self) -> Capabilities {
+        self.capabilities.clone()
+    }
+
+    /// Check if a feature is supported (v0.4.0)
+    ///
+    /// # Arguments
+    /// * `feature` - Feature to check
+    ///
+    /// # Returns
+    /// * `bool` - True if feature is supported
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use mosaic_core::Feature;
+    /// # use mosaic_core::MosaicStore;
+    /// # async fn example(store: MosaicStore) {
+    /// if store.supports(Feature::Wal) {
+    ///     // WAL is enabled
+    /// }
+    /// # }
+    /// ```
+    pub fn supports(&self, feature: Feature) -> bool {
+        self.capabilities.supports(feature)
+    }
+
+    /// Get feature info (v0.4.0)
+    ///
+    /// # Arguments
+    /// * `feature` - Feature to get info for
+    ///
+    /// # Returns
+    /// * `Option<FeatureInfo>` - Feature information if available
+    pub fn feature_info(&self, feature: Feature) -> Option<FeatureInfo> {
+        self.capabilities.feature_info(feature).cloned()
+    }
+
+    /// Get WAL statistics (v0.4.0)
+    ///
+    /// # Returns
+    /// * `Option<usize>` - Number of pending writes, or None if WAL is disabled
+    pub async fn wal_pending_count(&self) -> Option<usize> {
+        match &self.wal_manager {
+            Some(wal) => Some(wal.pending_count().await),
+            None => None,
+        }
+    }
+
+    /// Perform crash recovery cleanup (v0.4.0)
+    ///
+    /// Cleans up stale writers and their pending writes.
+    ///
+    /// # Returns
+    /// * `Vec<String>` - List of stale writer IDs that were cleaned up
+    pub async fn cleanup_stale_writers(&self) -> Result<Vec<String>> {
+        if let Some(wal) = &self.wal_manager {
+            let stale_writers = wal.get_stale_writers().await?;
+            let mut cleaned_writers = Vec::new();
+
+            for stale_writer_id in &stale_writers {
+                let deleted_count = wal.cleanup_stale_writer(stale_writer_id).await?;
+                tracing::info!(
+                    "Cleaned up {} pending writes for stale writer: {}",
+                    deleted_count,
+                    stale_writer_id
+                );
+                cleaned_writers.push(stale_writer_id.clone());
+            }
+
+            Ok(cleaned_writers)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Shutdown store gracefully (v0.4.0)
+    ///
+    /// Writes final heartbeat and marks writer as shutting down.
+    pub async fn shutdown(&self) -> Result<()> {
+        if let Some(wal) = &self.wal_manager {
+            wal.shutdown().await?;
+            tracing::info!("Store shutdown complete for writer: {}", self.writer_id);
+        }
+        Ok(())
+    }
+
+    /// Get writer ID (v0.4.0)
+    pub fn writer_id(&self) -> &str {
+        &self.writer_id
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +660,12 @@ mod tests {
             base_path: None,
         });
 
-        let store = MosaicStore::new(Arc::new(backend), "test-mosaic".to_string());
+        let store = MosaicStore::new(
+            Arc::new(backend),
+            "test-mosaic".to_string(),
+            None,    // Auto-generate writer ID
+            false,   // Disable WAL for this test
+        );
 
         let batch = create_test_record_batch();
 
@@ -465,5 +680,93 @@ mod tests {
         let retrieved = store.get_entry("test query").await.unwrap();
         assert_eq!(batch.num_rows(), retrieved.num_rows());
         assert_eq!(batch.num_columns(), retrieved.num_columns());
+    }
+
+    #[tokio::test]
+    async fn test_wal_integration() {
+        use crate::storage::backends::memory::MemoryBackend;
+        use crate::storage::backend::ObjectStoreConfig;
+
+        // Use in-memory backend for testing
+        let backend = MemoryBackend::new(ObjectStoreConfig {
+            bucket: "test-bucket".to_string(),
+            prefix: "test-prefix".to_string(),
+            region: None,
+            endpoint: None,
+            access_key: None,
+            secret_key: None,
+            account_name: None,
+            account_key: None,
+            container: None,
+            project_id: None,
+            credentials_path: None,
+            base_path: None,
+        });
+
+        let store = MosaicStore::load(
+            Arc::new(backend),
+            "test-mosaic-wal".to_string(),
+            Some("test-writer".to_string()),
+            true,  // Enable WAL
+        )
+        .await
+        .unwrap();
+
+        // Check WAL is enabled
+        assert!(store.supports(Feature::Wal));
+        assert_eq!(store.wal_pending_count().await, Some(0));
+
+        let batch = create_test_record_batch();
+
+        // Store entry
+        let entry_id = store
+            .store_entry(batch.clone(), "test query with wal")
+            .await
+            .unwrap();
+        assert!(!entry_id.is_empty());
+
+        // WAL should be empty after successful write
+        assert_eq!(store.wal_pending_count().await, Some(0));
+
+        // Shutdown gracefully
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_capabilities() {
+        use crate::storage::backends::memory::MemoryBackend;
+        use crate::storage::backend::ObjectStoreConfig;
+
+        let backend = MemoryBackend::new(ObjectStoreConfig {
+            bucket: "test-bucket".to_string(),
+            prefix: "test-prefix".to_string(),
+            region: None,
+            endpoint: None,
+            access_key: None,
+            secret_key: None,
+            account_name: None,
+            account_key: None,
+            container: None,
+            project_id: None,
+            credentials_path: None,
+            base_path: None,
+        });
+
+        let store_with_wal = MosaicStore::new(
+            Arc::new(backend),
+            "test-mosaic-caps".to_string(),
+            None,
+            true,  // Enable WAL
+        );
+
+        // Check capabilities
+        let caps = store_with_wal.get_capabilities();
+        assert_eq!(caps.version, "0.4.0");
+        assert!(caps.supports(Feature::Wal));
+
+        // Check feature info
+        let wal_info = store_with_wal.feature_info(Feature::Wal);
+        assert!(wal_info.is_some());
+        assert!(wal_info.unwrap().enabled);
     }
 }

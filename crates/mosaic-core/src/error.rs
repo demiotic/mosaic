@@ -5,8 +5,17 @@ pub enum MosaicError {
     #[error("S3 error: {0}")]
     S3Error(String),
 
+    #[error("Storage error: {0}")]
+    Storage(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
 
     #[error("Entry not found: {0}")]
     NotFound(String),

@@ -1,12 +1,14 @@
 //! Mosaic Core - Storage format for distributed memory systems
 //!
-//! Version: 0.1.0 - "Hello Storage"
+//! Version: 0.4.0 - "WAL & Crash Safety + Feature Detection"
 //!
 //! This crate provides the core functionality for Mosaic:
 //! - Content-addressed blob storage
-//! - Append-only snapshot log
-//! - Exact-match queries
+//! - Append-only snapshot log with pre-built indexes
+//! - Exact-match queries (O(1) with indexes)
 //! - Arrow + Parquet serialization
+//! - Write-Ahead Log (WAL) for crash safety
+//! - Type-safe feature detection API
 //! - Multiple storage backends (S3, Local, Memory, Azure, GCS)
 //!
 //! # Example
@@ -59,12 +61,14 @@
 //! }
 //! ```
 
+pub mod capabilities;
 pub mod error;
 pub mod storage;
 pub mod store;
 pub mod types;
 
 // Re-export main types for convenience
+pub use capabilities::{Capabilities, DegradationPolicy, Feature, FeatureInfo};
 pub use error::{MosaicError, Result};
 pub use store::MosaicStore;
 pub use types::{Entry, EntryId, EntryMetadata};
